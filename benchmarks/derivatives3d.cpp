@@ -286,13 +286,31 @@ struct runner_1d{
             }
             for(auto const &fw : st.transforms){
                 auto key = std::make_pair(st.layout, fw.axis);
+                // a direction that is not contiguous is transposed locally first, a strided 1D
+                // transform is several times slower than the transpose
+                heffte::box3d<> const &lbox = box[st.layout];
+                order3 order = {fw.axis, 0, 0};
+                int j = 1;
+                for(int a : lbox.order) if (a != fw.axis) order[j++] = a;
+                heffte::box3d<> const tbox(lbox.low, lbox.high, order);
+                if (lbox.order[0] != fw.axis){
+                    auto const tboxes = heffte::reorder(boxes[st.layout], order);
+                    if (not executors.count(key)){
+                        to_contiguous[key]   = heffte::make_reshape3d<backend_tag>(nullptr, boxes[st.layout], tboxes, comm, options);
+                        from_contiguous[key] = heffte::make_reshape3d<backend_tag>(nullptr, tboxes, boxes[st.layout], comm, options);
+                        for(auto const *t : {&to_contiguous[key], &from_contiguous[key]})
+                            if (*t) workspace_size = std::max(workspace_size, (*t)->size_workspace());
+                        transposed_in.resize(count[st.layout]);
+                        transposed_out.resize(count[st.layout]);
+                    }
+                }
                 if (not executors.count(key)){
-                    executors[key] = heffte::make_executor_r2c<backend_tag>(nullptr, box[st.layout], fw.axis);
+                    executors[key] = heffte::make_executor_r2c<backend_tag>(nullptr, tbox, fw.axis);
                     fhat[key].resize(executors[key]->complex_size());
                     scratch[key].resize(executors[key]->complex_size());
                     exec_workspace_size = std::max(exec_workspace_size, executors[key]->workspace_size());
                 }
-                heffte::box3d<> const cbox = box[st.layout].r2c(fw.axis);
+                heffte::box3d<> const cbox = tbox.r2c(fw.axis);
                 for(auto const &o : fw.outputs){
                     auto fkey = std::make_tuple(st.layout, fw.axis, o.power);
                     if (not factors.count(fkey)){
@@ -316,6 +334,11 @@ struct runner_1d{
         exec_workspace.resize(exec_workspace_size);
     }
     double* field(int layout, field_key const &k){ return storage.at({layout, k}); }
+
+    void transpose(reshaper const &t, double const source[], double destination[], int size){
+        if (t) t->apply(1, source, destination, reshape_workspace.data());
+        else std::copy_n(source, size, destination);
+    }
 
     void move(int src, int dst, std::vector<field_key> const &keys){
         int const batch = static_cast<int>(keys.size());
@@ -341,11 +364,22 @@ struct runner_1d{
                 auto &exec = executors[key];
                 auto &fh = fhat[key];
                 auto &sc = scratch[key];
-                exec->forward(field(st.layout, fw.input), fh.data(), exec_workspace.data());
+                bool const transposed = to_contiguous.count(key) > 0;
+                if (transposed){
+                    transpose(to_contiguous[key], field(st.layout, fw.input), transposed_in.data(), count[st.layout]);
+                    exec->forward(transposed_in.data(), fh.data(), exec_workspace.data());
+                }else{
+                    exec->forward(field(st.layout, fw.input), fh.data(), exec_workspace.data());
+                }
                 for(auto const &o : fw.outputs){
                     auto const &fac = factors[std::make_tuple(st.layout, fw.axis, o.power)];
                     for(size_t i = 0; i < fh.size(); i++) sc[i] = fac[i] * fh[i];
-                    exec->backward(sc.data(), field(st.layout, o.output), exec_workspace.data());
+                    if (transposed){
+                        exec->backward(sc.data(), transposed_out.data(), exec_workspace.data());
+                        transpose(from_contiguous[key], transposed_out.data(), field(st.layout, o.output), count[st.layout]);
+                    }else{
+                        exec->backward(sc.data(), field(st.layout, o.output), exec_workspace.data());
+                    }
                 }
             }
             double t2 = MPI_Wtime();
@@ -361,14 +395,14 @@ struct runner_1d{
     int n, me;
     std::vector<heffte::box3d<>> box;
     std::array<int, num_layouts> count = {};
-    std::map<std::pair<int, int>, reshaper> shapers;
+    std::map<std::pair<int, int>, reshaper> shapers, to_contiguous, from_contiguous;
     std::map<std::pair<int, int>, std::unique_ptr<executor_r2c>> executors;
     std::map<std::pair<int, int>, std::vector<std::complex<double>>> fhat, scratch;
     std::map<std::tuple<int, int, int>, std::vector<std::complex<double>>> factors;
     std::map<std::pair<int, field_key>, double*> storage;
     std::list<std::vector<double>> blocks;
     size_t workspace_size = 0, staging_size = 0, exec_workspace_size = 0;
-    std::vector<double> reshape_workspace, staging;
+    std::vector<double> reshape_workspace, staging, transposed_in, transposed_out;
     std::vector<std::complex<double>> exec_workspace;
     double time_transform = 0.0, time_reshape = 0.0;
 };
@@ -480,8 +514,7 @@ void benchmark_derivatives(int n, int num_runs, MPI_Comm comm){
         {"slabs",   XY, {XY, YZ, XZ}, zlocal_spectrum,  false},
     };
 
-    // f and the exact derivatives in both home layouts
-    std::map<std::pair<int, order3>, std::vector<double>> exact;
+    // f in both home layouts, the exact derivatives are made when a set is checked
     std::map<int, std::vector<double>> input;
     for(auto const &fam : families){
         std::vector<double> &in = input[fam.home];
@@ -490,19 +523,17 @@ void benchmark_derivatives(int n, int num_runs, MPI_Comm comm){
             exact_value({0, 0, 0}, idx[0] * h, idx[1] * h, idx[2] * h, v);
             in.push_back(v);
         });
-        for(auto const &s : sets){
-            for(auto const &c : s.second){
-                std::vector<double> e;
-                bool known = true;
-                for_each_index(boxes[fam.home][me], [&](std::array<int, 3> const &idx){
-                    double v = 0.0;
-                    known = exact_value(c, idx[0] * h, idx[1] * h, idx[2] * h, v) and known;
-                    e.push_back(v);
-                });
-                if (known) exact[{fam.home, c}] = std::move(e);
-            }
-        }
     }
+    auto exact_field = [&](int home, order3 const &c, std::vector<double> &e)->bool{
+        e.clear();
+        bool known = true;
+        for_each_index(boxes[home][me], [&](std::array<int, 3> const &idx){
+            double v = 0.0;
+            known = exact_value(c, idx[0] * h, idx[1] * h, idx[2] * h, v) and known;
+            e.push_back(v);
+        });
+        return known;
+    };
     // relative error against the exact value, or against the 3D result for the third order
     auto error = [&](double const computed[], std::vector<double> const &reference)->double{
         double local[2] = {0.0, 0.0};
@@ -576,29 +607,39 @@ void benchmark_derivatives(int n, int num_runs, MPI_Comm comm){
     for(auto const &s : sets){
         for(auto const &fam : families){
             auto const &c3 = best_3d[fam.name];
-            runner_3d r3(s.second, boxes[fam.home][me], fam.spectrum, c3.options, c3.batched, n, comm);
             plan_1d const plan = best_plan(s.second, fam.home, fam.layouts);
-            runner_1d r1(plan, boxes, best_1d[fam.name], n, comm);
-            std::copy(input[fam.home].begin(), input[fam.home].end(), r1.field(fam.home, {0, 0, 0}));
-
-            r3.run(input[fam.home].data());
-            r1.run();
+            int const k = static_cast<int>(s.second.size());
             double worst = 0.0, worst_3d = 0.0;
-            int const nr = r3.nr;
-            for(size_t d = 0; d < s.second.size(); d++){
-                auto const it = exact.find({fam.home, s.second[d]});
-                std::vector<double> const reference = (it != exact.end()) ? it->second
-                    : std::vector<double>(r3.output.begin() + d * nr, r3.output.begin() + (d + 1) * nr);
-                worst = std::max(worst, error(r1.field(fam.home, s.second[d]), reference));
-                if (it != exact.end()) worst_3d = std::max(worst_3d, error(r3.output.data() + d * nr, reference));
+            std::vector<double> reference;
+            std::map<int, std::vector<double>> from_3d;   // references without an exact formula
+            timing t3, t1;
+            double split_max[2];
+            {   // one method at a time keeps the resident memory down
+                runner_3d r3(s.second, boxes[fam.home][me], fam.spectrum, c3.options, c3.batched, n, comm);
+                r3.run(input[fam.home].data());
+                for(int d = 0; d < k; d++){
+                    if (exact_field(fam.home, s.second[d], reference))
+                        worst_3d = std::max(worst_3d, error(r3.output.data() + d * r3.nr, reference));
+                    else
+                        from_3d[d].assign(r3.output.begin() + d * r3.nr, r3.output.begin() + (d + 1) * r3.nr);
+                }
+                t3 = time_runs([&]{ r3.run(input[fam.home].data()); }, num_runs, comm);
+            }
+            {
+                runner_1d r1(plan, boxes, best_1d[fam.name], n, comm);
+                std::copy(input[fam.home].begin(), input[fam.home].end(), r1.field(fam.home, {0, 0, 0}));
+                r1.run();
+                for(int d = 0; d < k; d++){
+                    if (from_3d.count(d)) worst = std::max(worst, error(r1.field(fam.home, s.second[d]), from_3d[d]));
+                    else if (exact_field(fam.home, s.second[d], reference))
+                        worst = std::max(worst, error(r1.field(fam.home, s.second[d]), reference));
+                }
+                r1.time_transform = r1.time_reshape = 0.0;
+                t1 = time_runs([&]{ r1.run(); }, num_runs, comm);
+                double split[2] = {r1.time_transform / (num_runs + 1), r1.time_reshape / (num_runs + 1)};
+                MPI_Allreduce(split, split_max, 2, MPI_DOUBLE, MPI_MAX, comm);
             }
             pass = pass and worst < tolerance and worst_3d < tolerance;
-
-            timing const t3 = time_runs([&]{ r3.run(input[fam.home].data()); }, num_runs, comm);
-            r1.time_transform = r1.time_reshape = 0.0;
-            timing const t1 = time_runs([&]{ r1.run(); }, num_runs, comm);
-            double split[2] = {r1.time_transform / (num_runs + 1), r1.time_reshape / (num_runs + 1)}, split_max[2];
-            MPI_Allreduce(split, split_max, 2, MPI_DOUBLE, MPI_MAX, comm);
 
             std::string route = layout_names[plan.home];
             for(int l : plan.route) route += ">" + layout_names[l];
