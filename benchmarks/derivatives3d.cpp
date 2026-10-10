@@ -2,28 +2,45 @@
     -- heFFTe --
        Univ. of Tennessee, Knoxville
        @date
-       Value, gradient and Hessian of a periodic function: 3D transforms versus one direction at a time
+       Spectral derivatives of a periodic function: 3D transforms versus one direction at a time
 */
 
-// Computes f, f_x, f_y, f_z, f_xx, f_yy, f_zz, f_xy, f_yz, f_zx on an n^3 grid over [0, 2 pi)^3
-// for f = exp(g), g = sin(x) + cos(2y) / 2 + 0.4 sin(3z) + 0.3 sin(x + y) + 0.3 cos(y - z) + 0.2 sin(2x + z)
-// and compares two methods, both with input and output in x-pencils:
+// Computes derivatives such as f_x, f_yy or f_xy on an n^3 grid over [0, 2 pi)^3 for
+// f = exp(g), g = sin(x) + cos(2y) / 2 + 0.4 sin(3z) + 0.3 sin(x + y) + 0.3 cos(y - z) + 0.2 sin(2x + z),
+// for single components and for sets (gradient, gradient + Hessian diagonal, gradient + Hessian),
+// and times four methods; every result returns to the input layout:
 //
-//  3D:      one 3D r2c forward transform, then one 3D backward transform per field,
-//           either one at a time or as a single batch of ten
-//  pencils: a 1D derivative along the contiguous direction of each pencil layout,
-//           x-pencils:                       f   -> f_x, f_xx
-//           reshape f, f_x to y-pencils:     f   -> f_y, f_yy;  f_x -> f_xy
-//           reshape f, f_x, f_y to z-pencils: f  -> f_z, f_zz;  f_x -> f_zx;  f_y -> f_yz
-//           then optionally reshape the y and z results back to x-pencils,
-//           each reshape moves all its fields with one batched call
+//  3D pencils:  fft3d_r2c from x-pencils with the spectrum left in z-pencils, one forward and
+//               one backward transform per field (one at a time or batched)
+//  1D pencils:  1D transforms along the local direction of x, y and z pencils
+//  3D slabs:    fft3d_r2c from xy-slabs with the spectrum left in a z-local layout
+//  1D slabs:    1D transforms along the local directions of xy, yz and xz slabs
+//
+// The 1D methods take the derivative along the local directions of each layout they visit,
+// share intermediates (f_x is also the input of f_xy), move each field once to each layout
+// that needs it, and move all fields between the same two layouts with one batched reshape.
+// The route through the layouts is the one that moves the fewest fields, then makes the fewest
+// reshape calls, then takes the fewest 1D transforms.
+//
+// The plan options of the 3D methods (reorder, reshape algorithm, batched backward) and the
+// reshape algorithm of the 1D methods are chosen by timing the gradient + Hessian set,
+// then kept for every set.
 //
 // usage: mpirun -np <ranks> derivatives3d [n] [runs]
+//        prints a table and one CSV line per set and method (lines starting with CSV)
+
+#include <list>
+#include <map>
+#include <set>
+#include <sstream>
+#include <tuple>
 
 #include "heffte.h"
 
-using backend_tag = heffte::backend::default_backend<heffte::tag::cpu>::type;
+using backend_tag  = heffte::backend::default_backend<heffte::tag::cpu>::type;
 using executor_r2c = heffte::one_dim_backend<backend_tag>::executor_r2c;
+using reshaper     = std::unique_ptr<heffte::reshape3d_base<int>>;
+using order3       = std::array<int, 3>;
 
 //! \brief Holds the exponent g and its first and second derivatives at one point.
 struct exponent{
@@ -46,6 +63,27 @@ exponent make_exponent(double x, double y, double z){
     };
 }
 
+//! \brief The exact value of f or of one of its first or second derivatives, false when the order is higher.
+bool exact_value(order3 const &d, double x, double y, double z, double &value){
+    exponent const e = make_exponent(x, y, z);
+    double const f = std::exp(e.g);
+    int const total = d[0] + d[1] + d[2];
+    if (total == 0){ value = f; return true; }
+    std::array<double, 3> const g1 = {e.gx, e.gy, e.gz};
+    if (total == 1){
+        for(int a = 0; a < 3; a++) if (d[a] == 1) value = f * g1[a];
+        return true;
+    }
+    if (total == 2){
+        std::array<std::array<double, 3>, 3> const g2 = {{{e.gxx, e.gxy, e.gzx}, {e.gxy, e.gyy, e.gyz}, {e.gzx, e.gyz, e.gzz}}};
+        int a = -1, b = -1;
+        for(int i = 0; i < 3; i++) for(int k = 0; k < d[i]; k++) ((a < 0) ? a : b) = i;
+        value = f * (g2[a][b] + g1[a] * g1[b]);
+        return true;
+    }
+    return false;
+}
+
 //! \brief Factor (i k)^power / scale, the Nyquist mode is dropped from the odd powers.
 std::complex<double> spectral_factor(int k, int n, int power, double scale){
     if (power % 2 == 1 and 2 * std::abs(k) == n) return 0.0;
@@ -54,43 +92,354 @@ std::complex<double> spectral_factor(int k, int n, int power, double scale){
     return r;
 }
 
-/*!
- * \brief Derivatives along the contiguous direction of a pencil, one r2c and one c2r per requested power.
- */
-struct pencil_stage{
-    pencil_stage(heffte::box3d<> const box, int dimension) :
-        n(box.size[dimension]), line(n / 2 + 1),
-        executor(heffte::make_executor_r2c<backend_tag>(nullptr, box, dimension)),
-        fhat(executor->complex_size()), scratch(executor->complex_size()), workspace(executor->workspace_size())
-    {
-        if (box.order[0] != dimension) throw std::runtime_error("the pencil direction must be contiguous");
-        for(int power = 0; power <= 2; power++)
-            for(int c = 0; c < line; c++)
-                factors[power].push_back(spectral_factor(c, n, power, n));
-    }
-    //! \brief Computes the derivatives of the given powers of the field and writes them into the outputs.
-    void apply(double const field[], std::vector<std::pair<int, double*>> const &outputs){
-        executor->forward(field, fhat.data(), workspace.data());
-        for(auto const &out : outputs){
-            std::vector<std::complex<double>> const &factor = factors[out.first];
-            for(size_t i = 0; i < fhat.size(); i++)
-                scratch[i] = factor[i % line] * fhat[i];
-            executor->backward(scratch.data(), out.second, workspace.data());
+//! \brief Calls the function with the global (i, j, k) of every entry of the box, in memory order.
+template<typename callback>
+void for_each_index(heffte::box3d<> const &box, callback &&fn){
+    std::array<int, 3> idx;
+    for(int s = 0; s < box.osize(2); s++){
+        idx[box.order[2]] = box.low[box.order[2]] + s;
+        for(int m = 0; m < box.osize(1); m++){
+            idx[box.order[1]] = box.low[box.order[1]] + m;
+            for(int q = 0; q < box.osize(0); q++){
+                idx[box.order[0]] = box.low[box.order[0]] + q;
+                fn(idx);
+            }
         }
     }
-    int n, line;
-    std::unique_ptr<executor_r2c> executor;
-    std::vector<std::complex<double>> fhat, scratch, workspace;
-    std::array<std::vector<std::complex<double>>, 3> factors;
+}
+
+// ------------------------------------------------------------------------------------------- layouts
+enum layout_id{ X = 0, Y, Z, XY, YZ, XZ, num_layouts };
+std::array<std::string, num_layouts> const layout_names = {"X", "Y", "Z", "XY", "YZ", "XZ"};
+std::array<std::vector<int>, num_layouts> const local_axes = {{{0}, {1}, {2}, {0, 1}, {1, 2}, {0, 2}}};
+
+//! \brief The boxes of every layout, each pairing ranks to reduce the data moved from the previous one.
+std::array<std::vector<heffte::box3d<>>, num_layouts> make_layouts(heffte::box3d<> const world, int num_ranks){
+    std::array<int, 2> const grid = heffte::make_procgrid(num_ranks);
+    std::array<std::vector<heffte::box3d<>>, num_layouts> boxes;
+    boxes[X]  = heffte::split_world(world, {1, grid[0], grid[1]});
+    boxes[Y]  = heffte::make_pencils(world, grid, 1, boxes[X], {1, 0, 2});
+    boxes[Z]  = heffte::make_pencils(world, grid, 2, boxes[Y], {2, 0, 1});
+    boxes[XY] = heffte::make_slabs(world, num_ranks, 0, 1, boxes[X], {0, 1, 2}, heffte::rank_remap());
+    boxes[YZ] = heffte::make_slabs(world, num_ranks, 1, 2, boxes[XY], {1, 2, 0}, heffte::rank_remap());
+    boxes[XZ] = heffte::make_slabs(world, num_ranks, 0, 2, boxes[XY], {0, 2, 1}, heffte::rank_remap());
+    return boxes;
+}
+
+// --------------------------------------------------------------------------------- the 1D plan
+using field_key = order3;   // the derivative orders applied so far
+
+/*!
+ * \brief A plan for the one-direction-at-a-time method.
+ *
+ * Each stage moves in the fields it needs, then transforms along its local directions in increasing
+ * order, so an intermediate made along one direction can feed the next direction in the same stage.
+ */
+struct plan_1d{
+    struct derivative{ int power; field_key output; };
+    struct forward{ field_key input; int axis; std::vector<derivative> outputs; };
+    struct stage{ int layout; std::vector<std::pair<int, std::vector<field_key>>> moves_in; std::vector<forward> transforms; };
+    int home = X;
+    std::vector<int> route;
+    std::vector<stage> stages;
+    std::vector<std::pair<int, std::vector<field_key>>> moves_home;
+    int passes = 0, moved = 0, calls = 0;
+    bool valid = false;
 };
 
-//! \brief Applies a reshape that moves the given number of fields, a null reshape is a copy.
-void reshape(std::unique_ptr<heffte::reshape3d_base<int>> const &shaper, int batch_size, double const source[], double destination[],
-             int source_size, std::vector<double> &workspace){
-    if (shaper){
-        shaper->apply(batch_size, source, destination, workspace.data());
-    }else{
-        std::copy(source, source + batch_size * source_size, destination);
+plan_1d make_plan(std::vector<order3> const &components, int home, std::vector<int> const &route){
+    plan_1d p;
+    p.home = home;
+    p.route = route;
+    std::map<field_key, std::set<int>> present;
+    std::map<field_key, int> origin;
+    present[{0, 0, 0}] = {home};
+    origin[{0, 0, 0}] = home;
+    std::map<order3, field_key> state;
+    for(auto const &c : components) state[c] = {0, 0, 0};
+
+    std::vector<int> layouts = {home};
+    layouts.insert(layouts.end(), route.begin(), route.end());
+    for(int layout : layouts){
+        plan_1d::stage st;
+        st.layout = layout;
+        std::map<int, std::vector<field_key>> moves_in;
+        for(int axis : local_axes[layout]){
+            std::map<field_key, plan_1d::forward> forwards;
+            for(auto const &c : components){
+                field_key k = state[c];
+                if (c[axis] == k[axis]) continue;
+                if (not present[k].count(layout)){
+                    moves_in[origin[k]].push_back(k);
+                    present[k].insert(layout);
+                }
+                field_key out = k;
+                out[axis] = c[axis];
+                auto &fw = forwards[k];
+                fw.input = k;
+                fw.axis = axis;
+                bool known = false;
+                for(auto const &o : fw.outputs) if (o.output == out) known = true;
+                if (not known){
+                    if (present.count(out)) return p; // computed elsewhere, this route is not useful
+                    fw.outputs.push_back({c[axis], out});
+                    present[out] = {layout};
+                    origin[out] = layout;
+                }
+                state[c] = out;
+            }
+            for(auto &fw : forwards){
+                st.transforms.push_back(fw.second);
+                p.passes += 1 + static_cast<int>(fw.second.outputs.size());
+            }
+        }
+        for(auto &m : moves_in){
+            st.moves_in.push_back(m);
+            p.moved += static_cast<int>(m.second.size());
+            p.calls++;
+        }
+        p.stages.push_back(st);
+    }
+    for(auto const &c : components) if (state[c] != c) return p;
+    std::map<int, std::vector<field_key>> moves_home;
+    for(auto const &c : components){
+        if (not present[c].count(home)){
+            moves_home[origin[c]].push_back(c);
+            present[c].insert(home);
+        }
+    }
+    for(auto &m : moves_home){
+        p.moves_home.push_back(m);
+        p.moved += static_cast<int>(m.second.size());
+        p.calls++;
+    }
+    p.valid = true;
+    return p;
+}
+
+//! \brief Fewest moved fields, then fewest reshape calls, then fewest 1D transforms, over every route.
+plan_1d best_plan(std::vector<order3> const &components, int home, std::vector<int> const &family){
+    std::vector<int> others;
+    for(int l : family) if (l != home) others.push_back(l);
+    plan_1d best;
+    auto better = [](plan_1d const &a, plan_1d const &b){
+        return std::make_tuple(a.moved, a.calls, a.passes, a.route.size())
+             < std::make_tuple(b.moved, b.calls, b.passes, b.route.size());
+    };
+    int const m = static_cast<int>(others.size());
+    for(int mask = 0; mask < (1 << m); mask++){
+        std::vector<int> subset;
+        for(int i = 0; i < m; i++) if (mask & (1 << i)) subset.push_back(others[i]);
+        std::sort(subset.begin(), subset.end());
+        do{
+            plan_1d p = make_plan(components, home, subset);
+            if (p.valid and (not best.valid or better(p, best))) best = p;
+        }while(std::next_permutation(subset.begin(), subset.end()));
+    }
+    return best;
+}
+
+/*!
+ * \brief Executes a 1D plan: owns the fields in every layout, the executors and the reshapes.
+ */
+struct runner_1d{
+    runner_1d(plan_1d const &plan, std::array<std::vector<heffte::box3d<>>, num_layouts> const &boxes,
+              heffte::reshape_algorithm algorithm, int n, MPI_Comm comm) : p(plan), n(n), me(heffte::mpi::comm_rank(comm)){
+        heffte::plan_options options = heffte::default_options<backend_tag>();
+        options.algorithm = algorithm;
+        for(int l = 0; l < num_layouts; l++){
+            box.push_back(boxes[l][me]);
+            count[l] = box[l].count();
+        }
+        auto add_shaper = [&](int src, int dst, int batch){
+            auto key = std::make_pair(src, dst);
+            if (not shapers.count(key))
+                shapers[key] = heffte::make_reshape3d<backend_tag>(nullptr, boxes[src], boxes[dst], comm, options);
+            if (shapers[key]) workspace_size = std::max(workspace_size, batch * shapers[key]->size_workspace());
+            staging_size = std::max(staging_size, static_cast<size_t>(batch) * std::max(count[src], count[dst]));
+        };
+        // the received fields of a batch share one block, so the reshape writes them in place
+        auto receive = [&](int dst, std::vector<field_key> const &keys){
+            blocks.emplace_back(keys.size() * count[dst]);
+            for(size_t i = 0; i < keys.size(); i++) storage[{dst, keys[i]}] = blocks.back().data() + i * count[dst];
+        };
+        auto produce = [&](int layout, field_key const &k){
+            if (storage.count({layout, k})) return;
+            blocks.emplace_back(count[layout]);
+            storage[{layout, k}] = blocks.back().data();
+        };
+        // the fields computed in a layout that leave it together are allocated next to each other
+        std::map<std::pair<int, field_key>, bool> received;
+        for(auto const &st : p.stages) for(auto const &m : st.moves_in) for(auto const &k : m.second) received[{st.layout, k}] = true;
+        auto group_outgoing = [&](int layout, std::vector<field_key> const &keys){
+            for(auto const &k : keys) if (storage.count({layout, k}) or received.count({layout, k})) return;
+            blocks.emplace_back(keys.size() * count[layout]);
+            for(size_t i = 0; i < keys.size(); i++) storage[{layout, keys[i]}] = blocks.back().data() + i * count[layout];
+        };
+        for(auto const &m : p.moves_home) group_outgoing(m.first, m.second);
+        for(auto const &st : p.stages) for(auto const &m : st.moves_in) group_outgoing(m.first, m.second);
+        produce(p.home, {0, 0, 0});
+        for(auto const &st : p.stages){
+            for(auto const &m : st.moves_in){
+                add_shaper(m.first, st.layout, static_cast<int>(m.second.size()));
+                receive(st.layout, m.second);
+            }
+            for(auto const &fw : st.transforms){
+                auto key = std::make_pair(st.layout, fw.axis);
+                if (not executors.count(key)){
+                    executors[key] = heffte::make_executor_r2c<backend_tag>(nullptr, box[st.layout], fw.axis);
+                    fhat[key].resize(executors[key]->complex_size());
+                    scratch[key].resize(executors[key]->complex_size());
+                    exec_workspace_size = std::max(exec_workspace_size, executors[key]->workspace_size());
+                }
+                heffte::box3d<> const cbox = box[st.layout].r2c(fw.axis);
+                for(auto const &o : fw.outputs){
+                    auto fkey = std::make_tuple(st.layout, fw.axis, o.power);
+                    if (not factors.count(fkey)){
+                        std::vector<std::complex<double>> line(n / 2 + 1);
+                        for(int c = 0; c <= n / 2; c++) line[c] = spectral_factor(c, n, o.power, n);
+                        // the factor of every complex entry, in memory order
+                        std::vector<std::complex<double>> &fac = factors[fkey];
+                        fac.reserve(cbox.count());
+                        for_each_index(cbox, [&](std::array<int, 3> const &idx){ fac.push_back(line[idx[fw.axis]]); });
+                    }
+                    produce(st.layout, o.output);
+                }
+            }
+        }
+        for(auto const &m : p.moves_home){
+            add_shaper(m.first, p.home, static_cast<int>(m.second.size()));
+            receive(p.home, m.second);
+        }
+        reshape_workspace.resize(workspace_size);
+        staging.resize(staging_size);
+        exec_workspace.resize(exec_workspace_size);
+    }
+    double* field(int layout, field_key const &k){ return storage.at({layout, k}); }
+
+    void move(int src, int dst, std::vector<field_key> const &keys){
+        int const batch = static_cast<int>(keys.size());
+        double const *source = field(src, keys[0]);
+        bool contiguous = true;
+        for(int i = 1; i < batch; i++) contiguous = contiguous and field(src, keys[i]) == field(src, keys[0]) + i * count[src];
+        if (not contiguous){
+            for(int i = 0; i < batch; i++) std::copy_n(field(src, keys[i]), count[src], staging.data() + i * count[src]);
+            source = staging.data();
+        }
+        reshaper const &s = shapers.at({src, dst});
+        if (s) s->apply(batch, source, field(dst, keys[0]), reshape_workspace.data());
+        else std::copy_n(source, batch * count[src], field(dst, keys[0]));
+    }
+    //! \brief One evaluation, accumulates the time of the transforms and of the reshapes.
+    void run(){
+        for(auto const &st : p.stages){
+            double t0 = MPI_Wtime();
+            for(auto const &m : st.moves_in) move(m.first, st.layout, m.second);
+            double t1 = MPI_Wtime();
+            for(auto const &fw : st.transforms){
+                auto key = std::make_pair(st.layout, fw.axis);
+                auto &exec = executors[key];
+                auto &fh = fhat[key];
+                auto &sc = scratch[key];
+                exec->forward(field(st.layout, fw.input), fh.data(), exec_workspace.data());
+                for(auto const &o : fw.outputs){
+                    auto const &fac = factors[std::make_tuple(st.layout, fw.axis, o.power)];
+                    for(size_t i = 0; i < fh.size(); i++) sc[i] = fac[i] * fh[i];
+                    exec->backward(sc.data(), field(st.layout, o.output), exec_workspace.data());
+                }
+            }
+            double t2 = MPI_Wtime();
+            time_reshape   += t1 - t0;
+            time_transform += t2 - t1;
+        }
+        double t0 = MPI_Wtime();
+        for(auto const &m : p.moves_home) move(m.first, p.home, m.second);
+        time_reshape += MPI_Wtime() - t0;
+    }
+
+    plan_1d p;
+    int n, me;
+    std::vector<heffte::box3d<>> box;
+    std::array<int, num_layouts> count = {};
+    std::map<std::pair<int, int>, reshaper> shapers;
+    std::map<std::pair<int, int>, std::unique_ptr<executor_r2c>> executors;
+    std::map<std::pair<int, int>, std::vector<std::complex<double>>> fhat, scratch;
+    std::map<std::tuple<int, int, int>, std::vector<std::complex<double>>> factors;
+    std::map<std::pair<int, field_key>, double*> storage;
+    std::list<std::vector<double>> blocks;
+    size_t workspace_size = 0, staging_size = 0, exec_workspace_size = 0;
+    std::vector<double> reshape_workspace, staging;
+    std::vector<std::complex<double>> exec_workspace;
+    double time_transform = 0.0, time_reshape = 0.0;
+};
+
+// ----------------------------------------------------------------------------- the 3D baseline
+/*!
+ * \brief fft3d_r2c from the home layout with the spectrum left where the last 1D transform puts it.
+ */
+struct runner_3d{
+    runner_3d(std::vector<order3> const &components, heffte::box3d<> const inbox, heffte::box3d<> const outbox,
+              heffte::plan_options const options, bool batched, int n, MPI_Comm comm) :
+        fft(inbox, outbox, 0, comm, options), k(static_cast<int>(components.size())), batched(batched),
+        nr(fft.size_inbox()), nc(fft.size_outbox()),
+        fhat(nc), scaled(k * nc), output(k * nr), workspace((batched ? k : 1) * fft.size_workspace()),
+        multipliers(k * nc)
+    {
+        double const scale = double(n) * n * n;
+        for(int d = 0; d < k; d++){
+            int c = 0;
+            for_each_index(outbox, [&](std::array<int, 3> const &idx){
+                std::complex<double> m = 1.0;
+                for(int a = 0; a < 3; a++){
+                    int const kk = (a == 0 or 2 * idx[a] <= n) ? idx[a] : idx[a] - n;
+                    m *= spectral_factor(kk, n, components[d][a], (a == 0) ? scale : 1.0);
+                }
+                multipliers[d * nc + c++] = m;
+            });
+        }
+    }
+    void run(double const input[]){
+        fft.forward(input, fhat.data(), workspace.data());
+        for(int d = 0; d < k; d++){
+            for(int c = 0; c < nc; c++) scaled[d * nc + c] = multipliers[d * nc + c] * fhat[c];
+            if (not batched) fft.backward(scaled.data() + d * nc, output.data() + d * nr, workspace.data());
+        }
+        if (batched) fft.backward(k, scaled.data(), output.data(), workspace.data());
+    }
+    heffte::fft3d_r2c<backend_tag> fft;
+    int k;
+    bool batched;
+    int nr, nc;
+    std::vector<std::complex<double>> fhat, scaled;
+    std::vector<double> output;
+    std::vector<std::complex<double>> workspace, multipliers;
+};
+
+// ------------------------------------------------------------------------------------------- timing
+struct timing{ double median, minimum, p90; };
+
+//! \brief Times the call, each run is the slowest rank; one warm-up run is not counted.
+template<typename callback>
+timing time_runs(callback &&fn, int num_runs, MPI_Comm comm){
+    fn();
+    std::vector<double> t(num_runs);
+    for(int r = 0; r < num_runs; r++){
+        MPI_Barrier(comm);
+        double t0 = MPI_Wtime();
+        fn();
+        double local = MPI_Wtime() - t0;
+        MPI_Allreduce(&local, &t[r], 1, MPI_DOUBLE, MPI_MAX, comm);
+    }
+    std::sort(t.begin(), t.end());
+    return {t[num_runs / 2], t[0], t[std::min(num_runs - 1, (9 * num_runs) / 10)]};
+}
+
+std::string algorithm_name(heffte::reshape_algorithm a){
+    switch(a){
+        case heffte::reshape_algorithm::alltoallv: return "alltoallv";
+        case heffte::reshape_algorithm::alltoall:  return "alltoall";
+        case heffte::reshape_algorithm::p2p_plined: return "p2p_plined";
+        default: return "p2p";
     }
 }
 
@@ -98,242 +447,191 @@ void benchmark_derivatives(int n, int num_runs, MPI_Comm comm){
 
     int const me        = heffte::mpi::comm_rank(comm);
     int const num_ranks = heffte::mpi::comm_size(comm);
-
     double const h = 2.0 * 3.14159265358979323846 / n;
 
     heffte::box3d<> const world({0, 0, 0}, {n - 1, n - 1, n - 1});
+    auto const boxes = make_layouts(world, num_ranks);
     std::array<int, 2> const grid = heffte::make_procgrid(num_ranks);
 
-    // pencil layouts, each with its pencil direction contiguous in memory
-    std::vector<heffte::box3d<>> const xpencils = heffte::split_world(world, {1, grid[0], grid[1]});
-    std::vector<heffte::box3d<>> const ypencils = heffte::make_pencils(world, grid, 1, xpencils, {1, 0, 2});
-    std::vector<heffte::box3d<>> const zpencils = heffte::make_pencils(world, grid, 2, ypencils, {2, 0, 1});
-    heffte::box3d<> const xbox = xpencils[me], ybox = ypencils[me], zbox = zpencils[me];
-    int const nx = xbox.count(), ny = ybox.count(), nz = zbox.count();
+    // the spectrum of the 3D methods: z-pencils for the pencil method, y-split (z-local) for slabs
+    heffte::box3d<> const cworld = world.r2c(0);
+    heffte::box3d<> const zpencil_spectrum = heffte::split_world(cworld, {grid[0], grid[1], 1})[me];
+    heffte::box3d<> const zlocal_spectrum  = heffte::split_world(cworld, {1, num_ranks, 1})[me];
 
-    // the field and the exact derivatives in the x-pencils, ordered as the output of both methods
-    std::array<std::string, 10> const names = {"f", "f_x", "f_y", "f_z", "f_xx", "f_yy", "f_zz", "f_xy", "f_yz", "f_zx"};
-    std::array<std::array<int, 3>, 10> const orders = {{
-        {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1},
-        {2, 0, 0}, {0, 2, 0}, {0, 0, 2},
-        {1, 1, 0}, {0, 1, 1}, {1, 0, 1}
-    }};
-    std::vector<double> input(nx);
-    std::array<std::vector<double>, 10> exact;
-    for(auto &e : exact) e.resize(nx);
-    int idx = 0;
-    for(int k = xbox.low[2]; k <= xbox.high[2]; k++){
-        for(int j = xbox.low[1]; j <= xbox.high[1]; j++){
-            for(int i = xbox.low[0]; i <= xbox.high[0]; i++){
-                exponent const e = make_exponent(i * h, j * h, k * h);
-                double const f = std::exp(e.g);
-                input[idx] = f;
-                std::array<double, 10> const values = {
-                    f, f * e.gx, f * e.gy, f * e.gz,
-                    f * (e.gxx + e.gx * e.gx), f * (e.gyy + e.gy * e.gy), f * (e.gzz + e.gz * e.gz),
-                    f * (e.gxy + e.gx * e.gy), f * (e.gyz + e.gy * e.gz), f * (e.gzx + e.gz * e.gx)};
-                for(int d = 0; d < 10; d++) exact[d][idx] = values[d];
-                idx++;
+    std::vector<std::pair<std::string, std::vector<order3>>> const sets = {
+        {"f_x", {{1, 0, 0}}}, {"f_y", {{0, 1, 0}}}, {"f_z", {{0, 0, 1}}},
+        {"f_xx", {{2, 0, 0}}}, {"f_yy", {{0, 2, 0}}}, {"f_zz", {{0, 0, 2}}},
+        {"f_xy", {{1, 1, 0}}}, {"f_yz", {{0, 1, 1}}}, {"f_zx", {{1, 0, 1}}}, {"f_xyy", {{1, 2, 0}}},
+        {"gradient", {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}},
+        {"gradient+diag", {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {2, 0, 0}, {0, 2, 0}, {0, 0, 2}}},
+        {"gradient+Hessian", {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {2, 0, 0}, {0, 2, 0}, {0, 0, 2},
+                              {1, 1, 0}, {0, 1, 1}, {1, 0, 1}}},
+    };
+
+    struct family{
+        std::string name;
+        int home;
+        std::vector<int> layouts;
+        heffte::box3d<> spectrum;
+        bool use_pencils;
+    };
+    std::vector<family> const families = {
+        {"pencils", X,  {X, Y, Z},    zpencil_spectrum, true},
+        {"slabs",   XY, {XY, YZ, XZ}, zlocal_spectrum,  false},
+    };
+
+    // f and the exact derivatives in both home layouts
+    std::map<std::pair<int, order3>, std::vector<double>> exact;
+    std::map<int, std::vector<double>> input;
+    for(auto const &fam : families){
+        std::vector<double> &in = input[fam.home];
+        for_each_index(boxes[fam.home][me], [&](std::array<int, 3> const &idx){
+            double v = 0.0;
+            exact_value({0, 0, 0}, idx[0] * h, idx[1] * h, idx[2] * h, v);
+            in.push_back(v);
+        });
+        for(auto const &s : sets){
+            for(auto const &c : s.second){
+                std::vector<double> e;
+                bool known = true;
+                for_each_index(boxes[fam.home][me], [&](std::array<int, 3> const &idx){
+                    double v = 0.0;
+                    known = exact_value(c, idx[0] * h, idx[1] * h, idx[2] * h, v) and known;
+                    e.push_back(v);
+                });
+                if (known) exact[{fam.home, c}] = std::move(e);
             }
         }
     }
-
-    // the error of each field relative to its largest exact value, reduced over all ranks
-    auto max_error = [&](std::array<double const*, 10> const &computed)->std::array<double, 10>{
-        std::array<double, 10> result;
-        for(int d = 0; d < 10; d++){
-            double local[2] = {0.0, 0.0};
-            for(int i = 0; i < nx; i++){
-                local[0] = std::max(local[0], std::abs(exact[d][i]));
-                local[1] = std::max(local[1], std::abs(computed[d][i] - exact[d][i]));
-            }
-            double global[2];
-            MPI_Allreduce(local, global, 2, MPI_DOUBLE, MPI_MAX, comm);
-            result[d] = global[1] / global[0];
+    // relative error against the exact value, or against the 3D result for the third order
+    auto error = [&](double const computed[], std::vector<double> const &reference)->double{
+        double local[2] = {0.0, 0.0};
+        for(size_t i = 0; i < reference.size(); i++){
+            local[0] = std::max(local[0], std::abs(reference[i]));
+            local[1] = std::max(local[1], std::abs(computed[i] - reference[i]));
         }
-        return result;
+        double global[2];
+        MPI_Allreduce(local, global, 2, MPI_DOUBLE, MPI_MAX, comm);
+        return global[1] / global[0];
     };
 
-    // ----------------------------------------------------------------------------------------- 3D transforms
-    heffte::box3d<> const cbox = heffte::split_world(world.r2c(0), {1, grid[0], grid[1]})[me];
-    int const nc = cbox.count();
+    if (me == 0)
+        std::cout << "backend " << heffte::backend::name<backend_tag>() << ", grid " << n << "^3, " << num_ranks
+                  << " rank(s), pencil grid " << grid[0] << " x " << grid[1] << ", " << num_runs << " timed runs\n\n";
 
-    std::vector<std::complex<double>> fhat(nc), scaled(10 * nc);
-    std::vector<double> out3d(10 * nx);
-
-    // the multipliers of the ten fields, including the 1 / n^3 scaling of the backward transform
-    std::vector<std::complex<double>> multipliers(10 * nc);
-    for(int d = 0; d < 10; d++){
-        int c = 0;
-        for(int k = cbox.low[2]; k <= cbox.high[2]; k++){
-            int const kz = (2 * k <= n) ? k : k - n;
-            for(int j = cbox.low[1]; j <= cbox.high[1]; j++){
-                int const ky = (2 * j <= n) ? j : j - n;
-                for(int i = cbox.low[0]; i <= cbox.high[0]; i++){
-                    multipliers[d * nc + c] = spectral_factor(i, n, orders[d][0], double(n) * n * n)
-                                            * spectral_factor(ky, n, orders[d][1], 1.0)
-                                            * spectral_factor(kz, n, orders[d][2], 1.0);
-                    c++;
-                }
-            }
-        }
-    }
-
-    auto run_3d = [&](heffte::fft3d_r2c<backend_tag> const &fft, std::vector<std::complex<double>> &fft_workspace, bool batched){
-        fft.forward(input.data(), fhat.data(), fft_workspace.data());
-        for(int d = 0; d < 10; d++){
-            for(int c = 0; c < nc; c++) scaled[d * nc + c] = multipliers[d * nc + c] * fhat[c];
-            if (not batched) fft.backward(scaled.data() + d * nc, out3d.data() + d * nx, fft_workspace.data());
-        }
-        if (batched) fft.backward(10, scaled.data(), out3d.data(), fft_workspace.data());
-    };
-
-    // --------------------------------------------------------------------------------- one direction at a time
-    pencil_stage xstage(xbox, 0), ystage(ybox, 1), zstage(zbox, 2);
-
-    heffte::plan_options const options = heffte::default_options<backend_tag>();
-    auto xy = heffte::make_reshape3d<backend_tag>(nullptr, xpencils, ypencils, comm, options);
-    auto yz = heffte::make_reshape3d<backend_tag>(nullptr, ypencils, zpencils, comm, options);
-    auto yx = heffte::make_reshape3d<backend_tag>(nullptr, ypencils, xpencils, comm, options);
-    auto zx = heffte::make_reshape3d<backend_tag>(nullptr, zpencils, xpencils, comm, options);
-    size_t workspace_size = 0;
-    if (xy) workspace_size = std::max(workspace_size, 2 * xy->size_workspace());
-    if (yz) workspace_size = std::max(workspace_size, 3 * yz->size_workspace());
-    if (yx) workspace_size = std::max(workspace_size, 3 * yx->size_workspace());
-    if (zx) workspace_size = std::max(workspace_size, 4 * zx->size_workspace());
-    std::vector<double> reshape_workspace(workspace_size);
-
-    // consecutive fields in each layout, so that every reshape moves a contiguous batch
-    std::vector<double> xbuf(10 * nx); // f, f_x, f_xx, then f_y, f_yy, f_xy, f_z, f_zz, f_zx, f_yz returned
-    std::vector<double> ybuf(5 * ny);  // f, f_x, f_y, f_yy, f_xy
-    std::vector<double> zbuf(7 * nz);  // f, f_x, f_y, f_z, f_zz, f_zx, f_yz
-    double time_fft = 0.0, time_reshape = 0.0;
-
-    auto run_pencils = [&](bool return_to_x){
-        double t0 = MPI_Wtime();
-        std::copy(input.begin(), input.end(), xbuf.begin());
-        xstage.apply(&xbuf[0], {{1, &xbuf[nx]}, {2, &xbuf[2 * nx]}});
-        double t1 = MPI_Wtime();
-        reshape(xy, 2, &xbuf[0], &ybuf[0], nx, reshape_workspace);
-        double t2 = MPI_Wtime();
-        ystage.apply(&ybuf[0], {{1, &ybuf[2 * ny]}, {2, &ybuf[3 * ny]}});
-        ystage.apply(&ybuf[ny], {{1, &ybuf[4 * ny]}});
-        double t3 = MPI_Wtime();
-        reshape(yz, 3, &ybuf[0], &zbuf[0], ny, reshape_workspace);
-        double t4 = MPI_Wtime();
-        zstage.apply(&zbuf[0], {{1, &zbuf[3 * nz]}, {2, &zbuf[4 * nz]}});
-        zstage.apply(&zbuf[nz], {{1, &zbuf[5 * nz]}});
-        zstage.apply(&zbuf[2 * nz], {{1, &zbuf[6 * nz]}});
-        double t5 = MPI_Wtime();
-        if (return_to_x){
-            reshape(yx, 3, &ybuf[2 * ny], &xbuf[3 * nx], ny, reshape_workspace);
-            reshape(zx, 4, &zbuf[3 * nz], &xbuf[6 * nx], nz, reshape_workspace);
-        }
-        double t6 = MPI_Wtime();
-        time_fft     += (t1 - t0) + (t3 - t2) + (t5 - t4);
-        time_reshape += (t2 - t1) + (t4 - t3) + (t6 - t5);
-    };
-
-    // ----------------------------------------------------------------------------------------------- timing
-    // average of one evaluation of all ten fields, slowest rank, after one warm-up run
-    auto time_it = [&](auto &&run)->double{
-        run();
-        double total = 0.0;
-        for(int r = 0; r < num_runs; r++){
-            MPI_Barrier(comm);
-            double t0 = MPI_Wtime();
-            run();
-            total += MPI_Wtime() - t0;
-        }
-        double local = total / num_runs, global;
-        MPI_Reduce(&local, &global, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-        MPI_Bcast(&global, 1, MPI_DOUBLE, 0, comm);
-        return global;
-    };
-    auto output_errors = [&](std::vector<double> const &out, std::array<int, 10> const &slot)->std::array<double, 10>{
-        std::array<double const*, 10> fields;
-        for(int d = 0; d < 10; d++) fields[d] = out.data() + slot[d] * nx;
-        return max_error(fields);
-    };
-    double const tolerance = 1.E-10;
-    auto passes = [&](std::array<double, 10> const &err)->bool{
-        for(double e : err) if (not (e < tolerance)) return false;
-        return true;
-    };
-    bool pass = true;
-
-    if (me == 0) std::cout << "backend " << heffte::backend::name<backend_tag>() << ", grid " << n << "^3, "
-                           << num_ranks << " rank(s), pencil grid " << grid[0] << " x " << grid[1] << "\n\n"
-                           << "milliseconds per evaluation of all ten fields, average of " << num_runs << " runs\n\n"
-                           << "  3D transforms, by plan options     one at a time   batched backward\n";
-
-    // every combination of the plan options, the best one is the baseline
-    std::array<int, 10> const in_order = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-    double best_3d = 1.E300;
-    std::string best_name;
-    for(bool use_pencils : {true, false}){
-        for(bool use_reorder : {true, false}){
-            for(heffte::reshape_algorithm algorithm : {heffte::reshape_algorithm::alltoallv, heffte::reshape_algorithm::alltoall,
-                                                       heffte::reshape_algorithm::p2p_plined}){
-                heffte::plan_options options = heffte::default_options<backend_tag>();
-                options.use_pencils = use_pencils;
-                options.use_reorder = use_reorder;
-                options.algorithm   = algorithm;
-                heffte::fft3d_r2c<backend_tag> fft(xbox, cbox, 0, comm, options);
-                std::vector<std::complex<double>> fft_workspace(10 * fft.size_workspace());
-
-                run_3d(fft, fft_workspace, false);
-                bool const ok_single = passes(output_errors(out3d, in_order));
-                run_3d(fft, fft_workspace, true);
-                bool const ok_batch = passes(output_errors(out3d, in_order));
-                pass = pass and ok_single and ok_batch;
-
-                double const t_single = time_it([&]{ run_3d(fft, fft_workspace, false); });
-                double const t_batch  = time_it([&]{ run_3d(fft, fft_workspace, true); });
-
-                std::ostringstream name;
-                name << (use_pencils ? "pencils" : "slabs  ") << (use_reorder ? ", reorder" : ", no reorder")
-                     << ", " << ((algorithm == heffte::reshape_algorithm::alltoallv) ? "alltoallv" :
-                                 ((algorithm == heffte::reshape_algorithm::alltoall) ? "alltoall" : "p2p pipelined"));
-                for(auto t : {std::make_pair(t_single, std::string(", one at a time")), std::make_pair(t_batch, std::string(", batched"))}){
-                    if (t.first < best_3d){
-                        best_3d   = t.first;
-                        best_name = name.str() + t.second;
+    // ------------------------------------------------------------ choosing the options on the full set
+    std::vector<order3> const &full = sets.back().second;
+    std::vector<heffte::reshape_algorithm> const algorithms = {heffte::reshape_algorithm::alltoallv,
+                                                               heffte::reshape_algorithm::alltoall,
+                                                               heffte::reshape_algorithm::p2p_plined};
+    int const tuning_runs = std::max(3, num_runs / 3);
+    struct choice_3d{ heffte::plan_options options = heffte::default_options<backend_tag>(); bool batched = false; std::string name; };
+    std::map<std::string, choice_3d> best_3d;
+    std::map<std::string, heffte::reshape_algorithm> best_1d;
+    for(auto const &fam : families){
+        double best = 1.E300;
+        for(bool reorder : {true, false}){
+            for(auto alg : algorithms){
+                for(bool batched : {false, true}){
+                    heffte::plan_options options = heffte::default_options<backend_tag>();
+                    options.use_pencils = fam.use_pencils;
+                    options.use_reorder = reorder;
+                    options.algorithm = alg;
+                    runner_3d r(full, boxes[fam.home][me], fam.spectrum, options, batched, n, comm);
+                    double const t = time_runs([&]{ r.run(input[fam.home].data()); }, tuning_runs, comm).median;
+                    if (t < best){
+                        best = t;
+                        best_3d[fam.name] = {options, batched, std::string(reorder ? "reorder" : "no reorder") + " "
+                                             + algorithm_name(alg) + (batched ? " batched" : " one at a time")};
                     }
                 }
-                if (me == 0) std::cout << "  " << std::left << std::setw(36) << name.str() << std::right << std::fixed << std::setprecision(2)
-                                       << std::setw(10) << 1.E3 * t_single << std::setw(17) << 1.E3 * t_batch
-                                       << ((ok_single and ok_batch) ? "" : "   FAILED") << "\n";
+            }
+        }
+        best = 1.E300;
+        plan_1d const plan = best_plan(full, fam.home, fam.layouts);
+        for(auto alg : algorithms){
+            runner_1d r(plan, boxes, alg, n, comm);
+            std::copy(input[fam.home].begin(), input[fam.home].end(), r.field(fam.home, {0, 0, 0}));
+            double const t = time_runs([&]{ r.run(); }, tuning_runs, comm).median;
+            if (t < best){
+                best = t;
+                best_1d[fam.name] = alg;
+            }
+        }
+        if (me == 0) std::cout << "options for " << fam.name << ": 3D " << best_3d[fam.name].name
+                               << "; 1D " << algorithm_name(best_1d[fam.name]) << "\n";
+    }
+
+    // --------------------------------------------------------------------------------- the campaign
+    if (me == 0)
+        std::cout << "\nmilliseconds per evaluation, median of " << num_runs << " [min, p90]; speedup of the medians\n\n"
+                  << std::left << std::setw(18) << "set" << std::setw(9) << "family" << std::right
+                  << std::setw(26) << "3D" << std::setw(26) << "1D" << std::setw(9) << "speedup"
+                  << std::setw(8) << "passes" << std::setw(7) << "moved" << std::setw(7) << "calls"
+                  << "  " << std::left << std::setw(11) << "route" << std::right << std::setw(9) << "err 1D" << std::setw(9) << "err 3D" << "\n";
+
+    bool pass = true;
+    double const tolerance = 1.E-10;
+    std::vector<std::string> csv_lines;
+    for(auto const &s : sets){
+        for(auto const &fam : families){
+            auto const &c3 = best_3d[fam.name];
+            runner_3d r3(s.second, boxes[fam.home][me], fam.spectrum, c3.options, c3.batched, n, comm);
+            plan_1d const plan = best_plan(s.second, fam.home, fam.layouts);
+            runner_1d r1(plan, boxes, best_1d[fam.name], n, comm);
+            std::copy(input[fam.home].begin(), input[fam.home].end(), r1.field(fam.home, {0, 0, 0}));
+
+            r3.run(input[fam.home].data());
+            r1.run();
+            double worst = 0.0, worst_3d = 0.0;
+            int const nr = r3.nr;
+            for(size_t d = 0; d < s.second.size(); d++){
+                auto const it = exact.find({fam.home, s.second[d]});
+                std::vector<double> const reference = (it != exact.end()) ? it->second
+                    : std::vector<double>(r3.output.begin() + d * nr, r3.output.begin() + (d + 1) * nr);
+                worst = std::max(worst, error(r1.field(fam.home, s.second[d]), reference));
+                if (it != exact.end()) worst_3d = std::max(worst_3d, error(r3.output.data() + d * nr, reference));
+            }
+            pass = pass and worst < tolerance and worst_3d < tolerance;
+
+            timing const t3 = time_runs([&]{ r3.run(input[fam.home].data()); }, num_runs, comm);
+            r1.time_transform = r1.time_reshape = 0.0;
+            timing const t1 = time_runs([&]{ r1.run(); }, num_runs, comm);
+            double split[2] = {r1.time_transform / (num_runs + 1), r1.time_reshape / (num_runs + 1)}, split_max[2];
+            MPI_Allreduce(split, split_max, 2, MPI_DOUBLE, MPI_MAX, comm);
+
+            std::string route = layout_names[plan.home];
+            for(int l : plan.route) route += ">" + layout_names[l];
+            if (me == 0){
+                auto cell = [](timing const &t){
+                    std::ostringstream os;
+                    os << std::fixed << std::setprecision(2) << 1.E3 * t.median << " [" << 1.E3 * t.minimum << ", " << 1.E3 * t.p90 << "]";
+                    return os.str();
+                };
+                std::ostringstream row;
+                row << std::left << std::setw(18) << s.first << std::setw(9) << fam.name << std::right
+                    << std::setw(26) << cell(t3) << std::setw(26) << cell(t1)
+                    << std::fixed << std::setprecision(2) << std::setw(8) << t3.median / t1.median << "x"
+                    << std::setw(8) << plan.passes << std::setw(7) << plan.moved << std::setw(7) << plan.calls
+                    << "  " << std::left << std::setw(11) << route << std::right
+                    << std::scientific << std::setprecision(1) << std::setw(9) << worst << std::setw(9) << worst_3d;
+                std::cout << row.str() << std::endl;
+                std::ostringstream csv;
+                csv << std::setprecision(6) << "CSV," << n << "," << num_ranks << "," << s.first << "," << fam.name << ","
+                    << t3.median << "," << t3.minimum << "," << t3.p90 << ","
+                    << t1.median << "," << t1.minimum << "," << t1.p90 << ","
+                    << split_max[0] << "," << split_max[1] << ","
+                    << plan.passes << "," << plan.moved << "," << plan.calls << "," << route << "," << worst << "," << worst_3d << ","
+                    << c3.name << "," << algorithm_name(best_1d[fam.name]);
+                csv_lines.push_back(csv.str());
             }
         }
     }
-
-    // pencils, verified after the return to x-pencils,
-    // xbuf holds f, f_x, f_xx, f_y, f_yy, f_xy, f_z, f_zz, f_zx, f_yz
-    run_pencils(true);
-    std::array<double, 10> const err_pencils = output_errors(xbuf, {0, 1, 3, 6, 2, 4, 7, 5, 9, 8});
-    pass = pass and passes(err_pencils);
-
-    double const t_inplace  = time_it([&]{ run_pencils(false); });
-    time_fft = time_reshape = 0.0;
-    double const t_returned = time_it([&]{ run_pencils(true); });
-    double split[2] = {time_fft / (num_runs + 1), time_reshape / (num_runs + 1)}, split_max[2];
-    MPI_Reduce(split, split_max, 2, MPI_DOUBLE, MPI_MAX, 0, comm);
-
     if (me == 0){
-        std::cout << std::fixed << std::setprecision(2)
-                  << "\n  best 3D: " << best_name << ", " << 1.E3 * best_3d << "\n\n"
-                  << "  one direction at a time\n"
-                  << "    results left in the pencils:    " << std::setw(8) << 1.E3 * t_inplace
-                  << "   (" << best_3d / t_inplace << "x faster than the best 3D)\n"
-                  << "    results back in x-pencils:      " << std::setw(8) << 1.E3 * t_returned
-                  << "   (" << best_3d / t_returned << "x faster than the best 3D)\n"
-                  << "      of which 1D transforms:       " << std::setw(8) << 1.E3 * split_max[0] << "\n"
-                  << "      of which reshapes:            " << std::setw(8) << 1.E3 * split_max[1] << "\n\n"
-                  << std::scientific << std::setprecision(2)
-                  << "  relative errors, one direction at a time\n";
-        for(int d = 0; d < 10; d++) std::cout << "    " << std::setw(5) << names[d] << "  " << err_pencils[d] << "\n";
-        std::cout << "\n" << (pass ? "all relative errors below " : "FAILED, an error exceeds ") << tolerance << "\n";
+        std::cout << "\n" << (pass ? "all relative errors below " : "FAILED, an error exceeds ") << tolerance << "\n\n"
+                  << "CSV,n,ranks,set,family,3d_median,3d_min,3d_p90,1d_median,1d_min,1d_p90,"
+                  << "1d_transform,1d_reshape,passes,moved,calls,route,error_1d,error_3d,3d_options,1d_algorithm\n";
+        for(auto const &l : csv_lines) std::cout << l << "\n";
     }
 }
 
@@ -342,7 +640,7 @@ int main(int argc, char** argv){
     MPI_Init(&argc, &argv);
 
     int const n        = (argc > 1) ? std::stoi(argv[1]) : 128;
-    int const num_runs = (argc > 2) ? std::stoi(argv[2]) : 10;
+    int const num_runs = (argc > 2) ? std::stoi(argv[2]) : 20;
 
     benchmark_derivatives(n, num_runs, MPI_COMM_WORLD);
 
