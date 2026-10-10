@@ -11,6 +11,9 @@ target_link_libraries(heffte_example_options Heffte)
 add_executable(heffte_example_r2c heffte_example_r2c.cpp)
 target_link_libraries(heffte_example_r2c Heffte)
 
+add_executable(heffte_example_derivatives heffte_example_derivatives.cpp)
+target_link_libraries(heffte_example_derivatives Heffte)
+
 if (Heffte_ENABLE_FFTW)
     add_executable(heffte_example_fftw heffte_example_fftw.cpp)
     target_link_libraries(heffte_example_fftw Heffte)

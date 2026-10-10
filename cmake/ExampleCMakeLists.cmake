@@ -18,6 +18,9 @@ target_link_libraries(heffte_example_vectors Heffte::Heffte)
 add_executable(heffte_example_r2c heffte_example_r2c.cpp)
 target_link_libraries(heffte_example_r2c Heffte::Heffte)
 
+add_executable(heffte_example_derivatives heffte_example_derivatives.cpp)
+target_link_libraries(heffte_example_derivatives Heffte::Heffte)
+
 add_executable(heffte_example_r2r heffte_example_r2r.cpp)
 target_link_libraries(heffte_example_r2r Heffte::Heffte)
 
