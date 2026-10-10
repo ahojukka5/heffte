@@ -359,12 +359,12 @@ struct plan_fftw<float, dir>{
      */
     plan_fftw(int size, int howmanyffts, int stride, int rdist, int cdist) :
         plan((dir == direction::forward) ?
-             fftwf_plan_many_dft_r2c(1, &size, howmanyffts, nullptr, nullptr, stride, rdist,
-                                                   nullptr, nullptr, stride, cdist,
+             fftwf_plan_many_dft_r2c(1, &size, howmanyffts, std::vector<float>(howmanyffts * rdist + size * stride).data(), nullptr, stride, rdist,
+                                                   reinterpret_cast<fftwf_complex*>(std::vector<std::complex<float>>(howmanyffts * cdist + size * stride).data()), nullptr, stride, cdist,
                                                    FFTW_ESTIMATE
                                    ) :
-             fftwf_plan_many_dft_c2r(1, &size, howmanyffts, nullptr, nullptr, stride, cdist,
-                                                   nullptr, nullptr, stride, rdist,
+             fftwf_plan_many_dft_c2r(1, &size, howmanyffts, reinterpret_cast<fftwf_complex*>(std::vector<std::complex<float>>(howmanyffts * cdist + size * stride).data()), nullptr, stride, cdist,
+                                                   std::vector<float>(howmanyffts * rdist + size * stride).data(), nullptr, stride, rdist,
                                                    FFTW_ESTIMATE
                                    ))
         {}
@@ -384,12 +384,12 @@ struct plan_fftw<double, dir>{
     //! \brief Identical to the float-complex specialization.
     plan_fftw(int size, int howmanyffts, int stride, int rdist, int cdist) :
         plan((dir == direction::forward) ?
-             fftw_plan_many_dft_r2c(1, &size, howmanyffts, nullptr, nullptr, stride, rdist,
-                                                   nullptr, nullptr, stride, cdist,
+             fftw_plan_many_dft_r2c(1, &size, howmanyffts, std::vector<double>(howmanyffts * rdist + size * stride).data(), nullptr, stride, rdist,
+                                                   reinterpret_cast<fftw_complex*>(std::vector<std::complex<double>>(howmanyffts * cdist + size * stride).data()), nullptr, stride, cdist,
                                                    FFTW_ESTIMATE
                                    ) :
-             fftw_plan_many_dft_c2r(1, &size, howmanyffts, nullptr, nullptr, stride, cdist,
-                                                   nullptr, nullptr, stride, rdist,
+             fftw_plan_many_dft_c2r(1, &size, howmanyffts, reinterpret_cast<fftw_complex*>(std::vector<std::complex<double>>(howmanyffts * cdist + size * stride).data()), nullptr, stride, cdist,
+                                                   std::vector<double>(howmanyffts * rdist + size * stride).data(), nullptr, stride, rdist,
                                                    FFTW_ESTIMATE
                                    ))
         {}
