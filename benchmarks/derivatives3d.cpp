@@ -26,9 +26,13 @@
 // reshape algorithm of the 1D methods are chosen by timing the gradient + Hessian set,
 // then kept for every set.
 //
+// With DERIVATIVES3D_ROCM defined it runs on rocFFT with device buffers and GPU-aware MPI,
+// linked with derivatives3d_kernels.hip, one GPU per rank.
+//
 // usage: mpirun -np <ranks> derivatives3d [n] [runs]
 //        prints a table and one CSV line per set and method (lines starting with CSV)
 
+#include <cstring>
 #include <list>
 #include <map>
 #include <set>
@@ -37,7 +41,34 @@
 
 #include "heffte.h"
 
-using backend_tag  = heffte::backend::default_backend<heffte::tag::cpu>::type;
+#ifdef DERIVATIVES3D_ROCM
+// GPU build: rocFFT, device buffers, GPU-aware reshapes; the kernels are in derivatives3d_kernels.hip
+using backend_tag = heffte::backend::rocfft;
+template<typename T> using device_vector = heffte::gpu::vector<T>;
+void device_multiply(long n, std::complex<double> const factor[], std::complex<double> const in[], std::complex<double> out[]);
+void device_copy(void *destination, void const *source, size_t bytes);
+void device_sync();
+#else
+using backend_tag = heffte::backend::default_backend<heffte::tag::cpu>::type;
+template<typename T> using device_vector = std::vector<T>;
+inline void device_multiply(long n, std::complex<double> const factor[], std::complex<double> const in[], std::complex<double> out[]){
+    for(long i = 0; i < n; i++) out[i] = factor[i] * in[i];
+}
+inline void device_copy(void *destination, void const *source, size_t bytes){ std::memcpy(destination, source, bytes); }
+inline void device_sync(){}
+#endif
+
+template<typename T> device_vector<T> to_device(std::vector<T> const &host){
+    device_vector<T> result(host.size());
+    device_copy(result.data(), host.data(), host.size() * sizeof(T));
+    return result;
+}
+template<typename T> std::vector<T> to_host(T const device[], size_t size){
+    std::vector<T> result(size);
+    device_copy(result.data(), device, size * sizeof(T));
+    return result;
+}
+
 using executor_r2c = heffte::one_dim_backend<backend_tag>::executor_r2c;
 using reshaper     = std::unique_ptr<heffte::reshape3d_base<int>>;
 using order3       = std::array<int, 3>;
@@ -300,14 +331,14 @@ struct runner_1d{
                         from_contiguous[key] = heffte::make_reshape3d<backend_tag>(nullptr, tboxes, boxes[st.layout], comm, options);
                         for(auto const *t : {&to_contiguous[key], &from_contiguous[key]})
                             if (*t) workspace_size = std::max(workspace_size, (*t)->size_workspace());
-                        transposed_in.resize(count[st.layout]);
-                        transposed_out.resize(count[st.layout]);
+                        transposed_in  = device_vector<double>(count[st.layout]);
+                        transposed_out = device_vector<double>(count[st.layout]);
                     }
                 }
                 if (not executors.count(key)){
                     executors[key] = heffte::make_executor_r2c<backend_tag>(nullptr, tbox, fw.axis);
-                    fhat[key].resize(executors[key]->complex_size());
-                    scratch[key].resize(executors[key]->complex_size());
+                    fhat[key]    = device_vector<std::complex<double>>(executors[key]->complex_size());
+                    scratch[key] = device_vector<std::complex<double>>(executors[key]->complex_size());
                     exec_workspace_size = std::max(exec_workspace_size, executors[key]->workspace_size());
                 }
                 heffte::box3d<> const cbox = tbox.r2c(fw.axis);
@@ -317,9 +348,10 @@ struct runner_1d{
                         std::vector<std::complex<double>> line(n / 2 + 1);
                         for(int c = 0; c <= n / 2; c++) line[c] = spectral_factor(c, n, o.power, n);
                         // the factor of every complex entry, in memory order
-                        std::vector<std::complex<double>> &fac = factors[fkey];
+                        std::vector<std::complex<double>> fac;
                         fac.reserve(cbox.count());
                         for_each_index(cbox, [&](std::array<int, 3> const &idx){ fac.push_back(line[idx[fw.axis]]); });
+                        factors[fkey] = to_device(fac);
                     }
                     produce(st.layout, o.output);
                 }
@@ -329,15 +361,15 @@ struct runner_1d{
             add_shaper(m.first, p.home, static_cast<int>(m.second.size()));
             receive(p.home, m.second);
         }
-        reshape_workspace.resize(workspace_size);
-        staging.resize(staging_size);
-        exec_workspace.resize(exec_workspace_size);
+        reshape_workspace = device_vector<double>(workspace_size);
+        staging           = device_vector<double>(staging_size);
+        exec_workspace    = device_vector<std::complex<double>>(exec_workspace_size);
     }
     double* field(int layout, field_key const &k){ return storage.at({layout, k}); }
 
     void transpose(reshaper const &t, double const source[], double destination[], int size){
         if (t) t->apply(1, source, destination, reshape_workspace.data());
-        else std::copy_n(source, size, destination);
+        else device_copy(destination, source, size * sizeof(double));
     }
 
     void move(int src, int dst, std::vector<field_key> const &keys){
@@ -346,18 +378,19 @@ struct runner_1d{
         bool contiguous = true;
         for(int i = 1; i < batch; i++) contiguous = contiguous and field(src, keys[i]) == field(src, keys[0]) + i * count[src];
         if (not contiguous){
-            for(int i = 0; i < batch; i++) std::copy_n(field(src, keys[i]), count[src], staging.data() + i * count[src]);
+            for(int i = 0; i < batch; i++) device_copy(staging.data() + i * count[src], field(src, keys[i]), count[src] * sizeof(double));
             source = staging.data();
         }
         reshaper const &s = shapers.at({src, dst});
         if (s) s->apply(batch, source, field(dst, keys[0]), reshape_workspace.data());
-        else std::copy_n(source, batch * count[src], field(dst, keys[0]));
+        else device_copy(field(dst, keys[0]), source, batch * count[src] * sizeof(double));
     }
     //! \brief One evaluation, accumulates the time of the transforms and of the reshapes.
     void run(){
         for(auto const &st : p.stages){
             double t0 = MPI_Wtime();
             for(auto const &m : st.moves_in) move(m.first, st.layout, m.second);
+            device_sync();
             double t1 = MPI_Wtime();
             for(auto const &fw : st.transforms){
                 auto key = std::make_pair(st.layout, fw.axis);
@@ -373,7 +406,7 @@ struct runner_1d{
                 }
                 for(auto const &o : fw.outputs){
                     auto const &fac = factors[std::make_tuple(st.layout, fw.axis, o.power)];
-                    for(size_t i = 0; i < fh.size(); i++) sc[i] = fac[i] * fh[i];
+                    device_multiply(static_cast<long>(fh.size()), fac.data(), fh.data(), sc.data());
                     if (transposed){
                         exec->backward(sc.data(), transposed_out.data(), exec_workspace.data());
                         transpose(from_contiguous[key], transposed_out.data(), field(st.layout, o.output), count[st.layout]);
@@ -382,12 +415,14 @@ struct runner_1d{
                     }
                 }
             }
+            device_sync();
             double t2 = MPI_Wtime();
             time_reshape   += t1 - t0;
             time_transform += t2 - t1;
         }
         double t0 = MPI_Wtime();
         for(auto const &m : p.moves_home) move(m.first, p.home, m.second);
+        device_sync();
         time_reshape += MPI_Wtime() - t0;
     }
 
@@ -397,13 +432,13 @@ struct runner_1d{
     std::array<int, num_layouts> count = {};
     std::map<std::pair<int, int>, reshaper> shapers, to_contiguous, from_contiguous;
     std::map<std::pair<int, int>, std::unique_ptr<executor_r2c>> executors;
-    std::map<std::pair<int, int>, std::vector<std::complex<double>>> fhat, scratch;
-    std::map<std::tuple<int, int, int>, std::vector<std::complex<double>>> factors;
+    std::map<std::pair<int, int>, device_vector<std::complex<double>>> fhat, scratch;
+    std::map<std::tuple<int, int, int>, device_vector<std::complex<double>>> factors;
     std::map<std::pair<int, field_key>, double*> storage;
-    std::list<std::vector<double>> blocks;
+    std::list<device_vector<double>> blocks;
     size_t workspace_size = 0, staging_size = 0, exec_workspace_size = 0;
-    std::vector<double> reshape_workspace, staging, transposed_in, transposed_out;
-    std::vector<std::complex<double>> exec_workspace;
+    device_vector<double> reshape_workspace, staging, transposed_in, transposed_out;
+    device_vector<std::complex<double>> exec_workspace;
     double time_transform = 0.0, time_reshape = 0.0;
 };
 
@@ -416,10 +451,10 @@ struct runner_3d{
               heffte::plan_options const options, bool batched, int n, MPI_Comm comm) :
         fft(inbox, outbox, 0, comm, options), k(static_cast<int>(components.size())), batched(batched),
         nr(fft.size_inbox()), nc(fft.size_outbox()),
-        fhat(nc), scaled(k * nc), output(k * nr), workspace((batched ? k : 1) * fft.size_workspace()),
-        multipliers(k * nc)
+        fhat(nc), scaled(k * nc), output(k * nr), workspace((batched ? k : 1) * fft.size_workspace())
     {
         double const scale = double(n) * n * n;
+        std::vector<std::complex<double>> host_multipliers(k * nc);
         for(int d = 0; d < k; d++){
             int c = 0;
             for_each_index(outbox, [&](std::array<int, 3> const &idx){
@@ -428,14 +463,15 @@ struct runner_3d{
                     int const kk = (a == 0 or 2 * idx[a] <= n) ? idx[a] : idx[a] - n;
                     m *= spectral_factor(kk, n, components[d][a], (a == 0) ? scale : 1.0);
                 }
-                multipliers[d * nc + c++] = m;
+                host_multipliers[d * nc + c++] = m;
             });
         }
+        multipliers = to_device(host_multipliers);
     }
     void run(double const input[]){
         fft.forward(input, fhat.data(), workspace.data());
         for(int d = 0; d < k; d++){
-            for(int c = 0; c < nc; c++) scaled[d * nc + c] = multipliers[d * nc + c] * fhat[c];
+            device_multiply(nc, multipliers.data() + d * nc, fhat.data(), scaled.data() + d * nc);
             if (not batched) fft.backward(scaled.data() + d * nc, output.data() + d * nr, workspace.data());
         }
         if (batched) fft.backward(k, scaled.data(), output.data(), workspace.data());
@@ -444,9 +480,9 @@ struct runner_3d{
     int k;
     bool batched;
     int nr, nc;
-    std::vector<std::complex<double>> fhat, scaled;
-    std::vector<double> output;
-    std::vector<std::complex<double>> workspace, multipliers;
+    device_vector<std::complex<double>> fhat, scaled;
+    device_vector<double> output;
+    device_vector<std::complex<double>> workspace, multipliers;
 };
 
 // ------------------------------------------------------------------------------------------- timing
@@ -456,11 +492,13 @@ struct timing{ double median, minimum, p90; };
 template<typename callback>
 timing time_runs(callback &&fn, int num_runs, MPI_Comm comm){
     fn();
+    device_sync();
     std::vector<double> t(num_runs);
     for(int r = 0; r < num_runs; r++){
         MPI_Barrier(comm);
         double t0 = MPI_Wtime();
         fn();
+        device_sync();
         double local = MPI_Wtime() - t0;
         MPI_Allreduce(&local, &t[r], 1, MPI_DOUBLE, MPI_MAX, comm);
     }
@@ -524,6 +562,11 @@ void benchmark_derivatives(int n, int num_runs, MPI_Comm comm){
             in.push_back(v);
         });
     }
+    std::map<int, device_vector<double>> input_device;
+    for(auto const &fam : families) input_device[fam.home] = to_device(input[fam.home]);
+    auto load_input = [&](int home, double destination[]){
+        device_copy(destination, input[home].data(), input[home].size() * sizeof(double));
+    };
     auto exact_field = [&](int home, order3 const &c, std::vector<double> &e)->bool{
         e.clear();
         bool known = true;
@@ -548,7 +591,11 @@ void benchmark_derivatives(int n, int num_runs, MPI_Comm comm){
 
     if (me == 0)
         std::cout << "backend " << heffte::backend::name<backend_tag>() << ", grid " << n << "^3, " << num_ranks
-                  << " rank(s), pencil grid " << grid[0] << " x " << grid[1] << ", " << num_runs << " timed runs\n\n";
+                  << " rank(s), pencil grid " << grid[0] << " x " << grid[1] << ", " << num_runs << " timed runs"
+#ifdef DERIVATIVES3D_ROCM
+                  << (heffte::default_options<backend_tag>().use_gpu_aware ? ", GPU-aware MPI" : ", MPI from the host")
+#endif
+                  << "\n\n";
 
     // ------------------------------------------------------------ choosing the options on the full set
     std::vector<order3> const &full = sets.back().second;
@@ -569,7 +616,7 @@ void benchmark_derivatives(int n, int num_runs, MPI_Comm comm){
                     options.use_reorder = reorder;
                     options.algorithm = alg;
                     runner_3d r(full, boxes[fam.home][me], fam.spectrum, options, batched, n, comm);
-                    double const t = time_runs([&]{ r.run(input[fam.home].data()); }, tuning_runs, comm).median;
+                    double const t = time_runs([&]{ r.run(input_device[fam.home].data()); }, tuning_runs, comm).median;
                     if (t < best){
                         best = t;
                         best_3d[fam.name] = {options, batched, std::string(reorder ? "reorder" : "no reorder") + " "
@@ -582,7 +629,7 @@ void benchmark_derivatives(int n, int num_runs, MPI_Comm comm){
         plan_1d const plan = best_plan(full, fam.home, fam.layouts);
         for(auto alg : algorithms){
             runner_1d r(plan, boxes, alg, n, comm);
-            std::copy(input[fam.home].begin(), input[fam.home].end(), r.field(fam.home, {0, 0, 0}));
+            load_input(fam.home, r.field(fam.home, {0, 0, 0}));
             double const t = time_runs([&]{ r.run(); }, tuning_runs, comm).median;
             if (t < best){
                 best = t;
@@ -616,23 +663,24 @@ void benchmark_derivatives(int n, int num_runs, MPI_Comm comm){
             double split_max[2];
             {   // one method at a time keeps the resident memory down
                 runner_3d r3(s.second, boxes[fam.home][me], fam.spectrum, c3.options, c3.batched, n, comm);
-                r3.run(input[fam.home].data());
+                r3.run(input_device[fam.home].data());
                 for(int d = 0; d < k; d++){
                     if (exact_field(fam.home, s.second[d], reference))
-                        worst_3d = std::max(worst_3d, error(r3.output.data() + d * r3.nr, reference));
+                        worst_3d = std::max(worst_3d, error(to_host(r3.output.data() + d * r3.nr, r3.nr).data(), reference));
                     else
-                        from_3d[d].assign(r3.output.begin() + d * r3.nr, r3.output.begin() + (d + 1) * r3.nr);
+                        from_3d[d] = to_host(r3.output.data() + d * r3.nr, r3.nr);
                 }
-                t3 = time_runs([&]{ r3.run(input[fam.home].data()); }, num_runs, comm);
+                t3 = time_runs([&]{ r3.run(input_device[fam.home].data()); }, num_runs, comm);
             }
             {
                 runner_1d r1(plan, boxes, best_1d[fam.name], n, comm);
-                std::copy(input[fam.home].begin(), input[fam.home].end(), r1.field(fam.home, {0, 0, 0}));
+                load_input(fam.home, r1.field(fam.home, {0, 0, 0}));
                 r1.run();
                 for(int d = 0; d < k; d++){
-                    if (from_3d.count(d)) worst = std::max(worst, error(r1.field(fam.home, s.second[d]), from_3d[d]));
+                    std::vector<double> const computed = to_host(r1.field(fam.home, s.second[d]), input[fam.home].size());
+                    if (from_3d.count(d)) worst = std::max(worst, error(computed.data(), from_3d[d]));
                     else if (exact_field(fam.home, s.second[d], reference))
-                        worst = std::max(worst, error(r1.field(fam.home, s.second[d]), reference));
+                        worst = std::max(worst, error(computed.data(), reference));
                 }
                 r1.time_transform = r1.time_reshape = 0.0;
                 t1 = time_runs([&]{ r1.run(); }, num_runs, comm);
