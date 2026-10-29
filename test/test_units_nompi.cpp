@@ -5,6 +5,8 @@
        @date
 */
 
+#include <array>
+#include <cmath>
 #include <random>
 
 #include "test_common.h"
@@ -365,6 +367,56 @@ void test_1d_r2c(){
         sassert(approx(unload_result, input));
     }
 }
+#ifdef Heffte_ENABLE_FFTW
+// The FFTW r2c and c2r plans are executed out-of-place on the caller's arrays,
+// so they must be planned out-of-place and unaligned. Compares against a directly
+// summed DFT along every axis of shapes with long lines, a singleton axis,
+// odd lengths and strided batches.
+template<typename scalar_type>
+void test_fftw_r2c_plan_layouts(){
+    current_test<scalar_type, using_nompi> name("fftw r2c plan layouts");
+    double const tolerance = (std::is_same<scalar_type, float>::value) ? 2.E-5 : 1.E-12;
+    std::array<std::array<int, 3>, 6> const shapes = {{
+        {256, 1, 1}, {512, 1, 1}, {1, 24, 20}, {8, 1, 6}, {6, 4, 1}, {7, 3, 5}}};
+    for(auto const &n : shapes){
+        box3d<> const box = {{0, 0, 0}, {n[0] - 1, n[1] - 1, n[2] - 1}};
+        std::vector<scalar_type> input(box.count());
+        for(size_t i=0; i<input.size(); i++)
+            input[i] = static_cast<scalar_type>(0.5 + 0.2 * std::cos(0.1 * i) + 0.05 * std::sin(0.37 * i));
+        for(int dim=0; dim<3; dim++){
+            auto fft = heffte::make_executor_r2c<backend::fftw>(nullptr, box, dim);
+            std::vector<std::complex<scalar_type>> workspace(fft->workspace_size());
+            std::vector<std::complex<scalar_type>> result(fft->complex_size());
+            fft->forward(input.data(), result.data(), workspace.data());
+
+            box3d<> const cbox = box.r2c(dim);
+            int const len = n[dim];
+            bool finite = true;
+            double error = 0.0;
+            for(int k2=0; k2<cbox.size[2]; k2++) for(int k1=0; k1<cbox.size[1]; k1++) for(int k0=0; k0<cbox.size[0]; k0++){
+                std::array<int, 3> const k = {k0, k1, k2};
+                std::complex<double> expected = 0.0;
+                for(int j=0; j<len; j++){
+                    std::array<int, 3> p = k;
+                    p[dim] = j;
+                    double const phase = -2.0 * 3.14159265358979323846 * double(k[dim]) * j / len;
+                    expected += double(input[p[0] + n[0] * (p[1] + n[1] * p[2])]) * std::polar(1.0, phase);
+                }
+                std::complex<double> const actual = result[k0 + cbox.size[0] * (k1 + cbox.size[1] * k2)];
+                finite = finite and std::isfinite(actual.real()) and std::isfinite(actual.imag());
+                error = std::max(error, std::abs(actual - expected));
+            }
+            sassert(finite and error < tolerance * len);
+
+            std::vector<scalar_type> back(input.size());
+            fft->backward(result.data(), back.data(), workspace.data());
+            for(auto &b : back) b /= static_cast<scalar_type>(len);
+            sassert(approx(back, input));
+        }
+    }
+}
+#endif
+
 // instantiates a test for the backend tag using all cases of 1D real and complex transforms
 template<typename backend_tag>
 void test_1d(){
@@ -387,6 +439,8 @@ void test_1d_all(){
     #ifdef Heffte_ENABLE_FFTW
     test_1d<backend::fftw>();
     test_1d_r2r<backend::fftw_cos, backend::fftw_sin>();
+    test_fftw_r2c_plan_layouts<float>();
+    test_fftw_r2c_plan_layouts<double>();
     #endif
     #ifdef Heffte_ENABLE_MKL
     test_1d<backend::mkl>();
