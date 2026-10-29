@@ -9,6 +9,9 @@
 
 #include "heffte_r2r_executor.h"
 
+#include <cstddef>
+#include <vector>
+
 #ifdef Heffte_ENABLE_FFTW
 
 #include "fftw3.h"
@@ -357,17 +360,24 @@ struct plan_fftw<float, dir>{
      * \param rdist is the distance between the first entries of consecutive sequences in the real sequences
      * \param cdist is the distance between the first entries of consecutive sequences in the complex sequences
      */
-    plan_fftw(int size, int howmanyffts, int stride, int rdist, int cdist) :
-        plan((dir == direction::forward) ?
-             fftwf_plan_many_dft_r2c(1, &size, howmanyffts, nullptr, nullptr, stride, rdist,
-                                                   nullptr, nullptr, stride, cdist,
-                                                   FFTW_ESTIMATE
-                                   ) :
-             fftwf_plan_many_dft_c2r(1, &size, howmanyffts, nullptr, nullptr, stride, cdist,
-                                                   nullptr, nullptr, stride, rdist,
-                                                   FFTW_ESTIMATE
-                                   ))
-        {}
+    plan_fftw(int size, int howmanyffts, int stride, int rdist, int cdist){
+        // Execution uses distinct real/complex arrays. Preserve that layout
+        // when planning, including strided batches and singleton transforms.
+        std::size_t real_count = (size > 0 and howmanyffts > 0)
+            ? 1 + std::size_t(size - 1) * stride + std::size_t(howmanyffts - 1) * rdist : 1;
+        std::size_t complex_count = (size > 0 and howmanyffts > 0)
+            ? 1 + std::size_t(size / 2) * stride + std::size_t(howmanyffts - 1) * cdist : 1;
+        std::vector<float> real(real_count);
+        std::vector<std::complex<float>> complex(complex_count);
+        auto *cdata = reinterpret_cast<fftwf_complex*>(complex.data());
+        // New-array execution need not share the scratch arrays' alignment.
+        const unsigned flags = FFTW_ESTIMATE | FFTW_UNALIGNED;
+        plan = (dir == direction::forward)
+            ? fftwf_plan_many_dft_r2c(1, &size, howmanyffts, real.data(), nullptr, stride, rdist,
+                                       cdata, nullptr, stride, cdist, flags)
+            : fftwf_plan_many_dft_c2r(1, &size, howmanyffts, cdata, nullptr, stride, cdist,
+                                       real.data(), nullptr, stride, rdist, flags);
+    }
     //! \brief Identical to the float-complex specialization.
     ~plan_fftw(){ fftwf_destroy_plan(plan); }
     //! \brief Identical to the float-complex specialization.
@@ -382,17 +392,24 @@ struct plan_fftw<float, dir>{
 template<direction dir>
 struct plan_fftw<double, dir>{
     //! \brief Identical to the float-complex specialization.
-    plan_fftw(int size, int howmanyffts, int stride, int rdist, int cdist) :
-        plan((dir == direction::forward) ?
-             fftw_plan_many_dft_r2c(1, &size, howmanyffts, nullptr, nullptr, stride, rdist,
-                                                   nullptr, nullptr, stride, cdist,
-                                                   FFTW_ESTIMATE
-                                   ) :
-             fftw_plan_many_dft_c2r(1, &size, howmanyffts, nullptr, nullptr, stride, cdist,
-                                                   nullptr, nullptr, stride, rdist,
-                                                   FFTW_ESTIMATE
-                                   ))
-        {}
+    plan_fftw(int size, int howmanyffts, int stride, int rdist, int cdist){
+        // Execution uses distinct real/complex arrays. Preserve that layout
+        // when planning, including strided batches and singleton transforms.
+        std::size_t real_count = (size > 0 and howmanyffts > 0)
+            ? 1 + std::size_t(size - 1) * stride + std::size_t(howmanyffts - 1) * rdist : 1;
+        std::size_t complex_count = (size > 0 and howmanyffts > 0)
+            ? 1 + std::size_t(size / 2) * stride + std::size_t(howmanyffts - 1) * cdist : 1;
+        std::vector<double> real(real_count);
+        std::vector<std::complex<double>> complex(complex_count);
+        auto *cdata = reinterpret_cast<fftw_complex*>(complex.data());
+        // New-array execution need not share the scratch arrays' alignment.
+        const unsigned flags = FFTW_ESTIMATE | FFTW_UNALIGNED;
+        plan = (dir == direction::forward)
+            ? fftw_plan_many_dft_r2c(1, &size, howmanyffts, real.data(), nullptr, stride, rdist,
+                                       cdata, nullptr, stride, cdist, flags)
+            : fftw_plan_many_dft_c2r(1, &size, howmanyffts, cdata, nullptr, stride, cdist,
+                                       real.data(), nullptr, stride, rdist, flags);
+    }
     //! \brief Identical to the float-complex specialization.
     ~plan_fftw(){ fftw_destroy_plan(plan); }
     //! \brief Identical to the float-complex specialization.
